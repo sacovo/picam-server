@@ -1,0 +1,23 @@
+
+[build]
+pre-build = [
+  "dpkg --add-architecture $CROSS_DEB_ARCH",
+  # "apt-get update && apt-get --assume-yes install libcamera-dev:$CROSS_DEB_ARCH",
+  "apt-get update && apt-get --assume-yes install ninja-build python3-pip libyaml-dev python3-yaml python3-ply python3-jinja2 wget",
+  # libavcodec
+  "pip3 install meson",
+  "git clone https://git.sacovo.ch/sandro.covo/libcamera.git",
+  "cd libcamera",
+  "meson setup build-arm --cross-file aarch64.txt -Dprefix=/usr/aarch64-linux-gnu",
+  "meson setup build",
+  "ninja -C build-arm install",
+  "ninja -C build install",
+]
+
+[target.aarch64-unknown-linux-gnu.dockerfile]
+file = "./docker/Dockerfile.aarch64-unknown-linux-gnu"
+context = "./docker"
+
+[target.aarch64-unknown-linux-musl.dockerfile]
+file = "./docker/Dockerfile.aarch64-unknown-linux-musl"
+context = "./docker"
