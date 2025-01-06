@@ -1,4 +1,5 @@
 import socket
+import struct
 import cv2
 import av
 import sys
@@ -23,6 +24,11 @@ def main():
 
             # Receive and print data
             while True:
+                if i == 10:
+                    out = struct.pack("<II", 1920, 1080)
+                    client_socket.sendall(out)
+                    print("Sent data!")
+
                 b = client_socket.recv(4)
                 n_bytes = int.from_bytes(b, byteorder='big', signed=False)
                 print(f"Reading {n_bytes}")
@@ -35,7 +41,7 @@ def main():
                         raise EOFError
                     read += cr
 
-                print(buff[:4])
+                print('\n'.join([bin(x)[2:].zfill(9) for x in list(buff[:8])]))
                 packets = decoder.parse(buff)
                 print(len(packets))
                 for packet in packets:
