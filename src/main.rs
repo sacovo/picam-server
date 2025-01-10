@@ -18,12 +18,19 @@ use libcamera::{
     request::ReuseFlag,
     stream::StreamRole,
 };
+use num_traits::FromPrimitive;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{broadcast, mpsc, watch},
 };
+
+use num_derive::FromPrimitive;
 use v4l2r::{
+    controls::{
+        codec::{VideoBitrate, VideoH264Level, VideoH264Profile},
+        SafeExtControl,
+    },
     device::queue::{
         direction::Capture,
         dqbuf::DqBuffer,
@@ -31,6 +38,7 @@ use v4l2r::{
         handles_provider::MmapProvider,
     },
     encoder::{CompletedOutputBuffer, Encoder, ReadyToEncode},
+    ioctl::{s_ext_ctrls, CtrlWhich},
     memory::MmapHandle,
     Format,
 };
@@ -41,11 +49,35 @@ const HEIGHT: u32 = 1080;
 
 const PIXEL_FORMAT: PixelFormat = PixelFormat::new(u32::from_le_bytes(*PF), 0);
 
-enum Command {
+struct CameraResizeRequest {
+    width: u32,
+    height: u32,
+    stride: u32,
+    size: u32,
+}
+
+enum CameraCommand {
+    Resize(CameraResizeRequest),
+    Empty,
+}
+
+enum EncoderCommand {
     NextFrame,
-    Resize(u32, u32),
-    ResizeCamera(u32, u32, u32, u32),
     RestartEncoder,
+    Resize(Size),
+    SetBitrate(i32),
+    SetLevel(VideoH264Level),
+    SetProfile(VideoH264Profile),
+}
+
+#[derive(Debug, FromPrimitive)]
+enum ClientCommands {
+    RestartEncoder = 0,
+    Resize = 1,
+    SetBitrate = 2,
+    SetLevel = 3,
+    SetProfile = 4,
+    NextFrame = 10,
 }
 
 fn configure_camera(cfgs: &mut CameraConfiguration, width: u32, height: u32, stride: Option<u32>) {
@@ -65,7 +97,7 @@ fn configure_camera(cfgs: &mut CameraConfiguration, width: u32, height: u32, str
 fn camera_loop(
     idx: usize,
     tx: std::sync::mpsc::Sender<Arc<Vec<u8>>>,
-    mut rx: tokio::sync::watch::Receiver<Command>,
+    mut rx: tokio::sync::watch::Receiver<CameraCommand>,
 ) -> Result<()> {
     let manager = CameraManager::new().unwrap();
     let camera_list = manager.cameras();
@@ -96,10 +128,12 @@ fn camera_loop(
         if rx.has_changed()? {
             let cmd = rx.borrow_and_update();
             match *cmd {
-                Command::NextFrame => {}
-                Command::RestartEncoder => {}
-                Command::Resize(_, _) => {}
-                Command::ResizeCamera(width, height, stride, size) => {
+                CameraCommand::Resize(CameraResizeRequest {
+                    width,
+                    height,
+                    stride,
+                    size,
+                }) => {
                     println!("[CAM] Received new size: {width}x{height} with stride {stride}");
                     camera.stop()?;
                     configure_camera(&mut cfgs, width, height, Some(stride));
@@ -112,6 +146,7 @@ fn camera_loop(
                     camera.configure(&mut cfgs)?;
                     (stream, frame_size) = fun_name(&cfgs, &mut camera)?;
                 }
+                CameraCommand::Empty => {}
             }
         }
         let mut req = rxr.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -221,8 +256,8 @@ fn create_encoder(
 fn encoder_thread(
     frame_in: std::sync::mpsc::Receiver<Arc<Vec<u8>>>,
     encoder_out: broadcast::Sender<Arc<Vec<u8>>>,
-    mut next_frame: mpsc::Receiver<Command>,
-    tx_cam: watch::Sender<Command>,
+    mut next_frame: mpsc::Receiver<EncoderCommand>,
+    tx_cam: watch::Sender<CameraCommand>,
 ) -> Result<()> {
     let input_done_cb = |buffer: CompletedOutputBuffer<GenericBufferHandles>| {
         let handles = match buffer {
@@ -272,21 +307,19 @@ fn encoder_thread(
         match next_frame.try_recv() {
             Err(mpsc::error::TryRecvError::Empty) => continue, // Discard this frame
             Err(mpsc::error::TryRecvError::Disconnected) => break,
-            Ok(Command::NextFrame) => {
+            Ok(EncoderCommand::NextFrame) => {
                 // This means we should send this frame to the encoder
                 mapping.as_mut().copy_from_slice(&frame);
                 buf.queue(&[frame.len()])?;
             }
-            Ok(Command::ResizeCamera(_, _, _, _)) => (),
-            Ok(Command::RestartEncoder) => {
-                println!("[ENC] Restart requested");
+            Ok(EncoderCommand::RestartEncoder) => {
                 encoder = encoder
                     .stop()
                     .unwrap()
                     .start(input_done_cb, output_ready_cb.clone())
                     .unwrap();
             }
-            Ok(Command::Resize(width, height)) => {
+            Ok(EncoderCommand::Resize(Size { width, height })) => {
                 println!("[ENC] Received new size: {width}x{height}");
                 let old = encoder.stop();
                 drop(old);
@@ -295,13 +328,26 @@ fn encoder_thread(
                 let planeformat = cap.plane_fmt.first().unwrap();
                 encoder = tmp.start(input_done_cb, output_ready_cb.clone()).unwrap();
                 tx_cam
-                    .send(Command::ResizeCamera(
+                    .send(CameraCommand::Resize(CameraResizeRequest {
                         width,
                         height,
-                        planeformat.bytesperline,
-                        planeformat.sizeimage,
-                    ))
+                        stride: planeformat.bytesperline,
+                        size: planeformat.sizeimage,
+                    }))
                     .unwrap();
+            }
+            Ok(EncoderCommand::SetProfile(profile)) => {
+                let mut profile = SafeExtControl::<VideoH264Profile>::from_value(profile.into());
+                println!("[ENC] Setting new Profile: {}", profile.value());
+                s_ext_ctrls(&encoder, CtrlWhich::Current, &mut profile)?;
+            }
+            Ok(EncoderCommand::SetBitrate(bitrate)) => {
+                let mut bitrate = SafeExtControl::<VideoBitrate>::from_value(bitrate);
+                s_ext_ctrls(&encoder, CtrlWhich::Current, &mut bitrate)?;
+            }
+            Ok(EncoderCommand::SetLevel(level)) => {
+                let mut level = SafeExtControl::<VideoH264Level>::from_value(level.into());
+                s_ext_ctrls(&encoder, CtrlWhich::Current, &mut level)?;
             }
         };
     }
@@ -311,15 +357,16 @@ fn encoder_thread(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    println!("Basline {}", Into::<i32>::into(VideoH264Profile::Baseline));
     let cam_idx = 0;
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let (tx_cam, rx_cam) = tokio::sync::watch::channel(Command::NextFrame);
+    let (tx_cam, rx_cam) = tokio::sync::watch::channel(CameraCommand::Empty);
     thread::spawn(move || {
         camera_loop(cam_idx, tx, rx_cam).expect("Error in thread");
     });
 
-    let (tx_enc, _rx_enc) = tokio::sync::broadcast::channel(1);
+    let (tx_enc, _rx_enc) = tokio::sync::broadcast::channel(10);
     let (tx_next, rx_next) = tokio::sync::mpsc::channel(10);
     let tx_tmp = tx_enc.clone();
     thread::spawn(move || {
@@ -339,16 +386,87 @@ async fn main() -> Result<()> {
 
         tokio::spawn(async move {
             loop {
-                let mut buf = [0u8; 8];
+                let mut buf = [0u8; 2];
                 srx.read_exact(&mut buf)
                     .await
                     .expect("Could not read two values");
-                let width = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                let height = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                println!("[TCP] Received new size: {width}x{height}");
-                tx.send(Command::Resize(width, height))
-                    .await
-                    .expect("Could not send resize command");
+                let idx = i16::from_le_bytes(buf);
+
+                match FromPrimitive::from_i16(idx) {
+                    Some(ClientCommands::Resize) => {
+                        let mut buf = [0u8; 8];
+                        srx.read_exact(&mut buf)
+                            .await
+                            .expect("Could not read two values");
+                        println!("{:#?}", buf);
+                        let width = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u32;
+                        let height = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as u32;
+                        println!("[TCP] Received new size: {width}x{height}");
+                        tx.send(EncoderCommand::Resize(Size { width, height }))
+                            .await
+                            .expect("Could not send resize command");
+                        tx.send(EncoderCommand::RestartEncoder).await.expect("Send");
+                    }
+                    Some(ClientCommands::SetBitrate) => {
+                        let mut buf = [0u8; 4];
+                        srx.read_exact(&mut buf)
+                            .await
+                            .expect("Could not read two values");
+                        let size = i32::from_le_bytes(buf);
+                        println!("[TCP] Received new bitrate: {size}");
+                        tx.send(EncoderCommand::SetBitrate(size))
+                            .await
+                            .expect("Could not send bitrate cmd");
+                    }
+                    Some(ClientCommands::SetProfile) => {
+                        let mut buf = [0u8; 4];
+                        srx.read_exact(&mut buf)
+                            .await
+                            .expect("Could not read two values");
+                        let profile = match i32::from_le_bytes(buf) {
+                            1 => VideoH264Profile::Baseline,
+                            2 => VideoH264Profile::Main,
+                            3 => VideoH264Profile::High,
+                            _ => VideoH264Profile::Baseline,
+                        };
+
+                        println!("[TCP] Received new profile: {profile:?}");
+                        tx.send(EncoderCommand::SetProfile(profile))
+                            .await
+                            .expect("Could not send bitrate cmd");
+                    }
+                    Some(ClientCommands::SetLevel) => {
+                        let mut buf = [0u8; 4];
+                        srx.read_exact(&mut buf)
+                            .await
+                            .expect("Could not read two values");
+                        let level = match i32::from_le_bytes(buf) {
+                            11 => VideoH264Level::L1_1,
+                            21 => VideoH264Level::L2_1,
+                            22 => VideoH264Level::L2_2,
+                            3 => VideoH264Level::L3_1,
+                            32 => VideoH264Level::L3_2,
+                            4 => VideoH264Level::L4_0,
+                            41 => VideoH264Level::L4_1,
+                            _ => VideoH264Level::L4_2,
+                        };
+                        println!("[TCP] Received new profile: {level:?}");
+                        tx.send(EncoderCommand::SetLevel(level))
+                            .await
+                            .expect("Could not send bitrate cmd");
+                    }
+                    Some(ClientCommands::RestartEncoder) => {
+                        tx.send(EncoderCommand::RestartEncoder)
+                            .await
+                            .expect("Could not send cmd");
+                    }
+                    Some(ClientCommands::NextFrame) => {
+                        tx.send(EncoderCommand::NextFrame)
+                            .await
+                            .expect("Could not send cmd");
+                    }
+                    None => {}
+                }
             }
         });
 
@@ -356,13 +474,10 @@ async fn main() -> Result<()> {
         println!("New connection from {addr}");
 
         tokio::spawn(async move {
-            tx.send(Command::RestartEncoder)
+            tx.send(EncoderCommand::RestartEncoder)
                 .await
                 .expect("Could not send restart cmd");
             loop {
-                // Tell the encoder that we are ready for a new frame
-                tx.send(Command::NextFrame).await.unwrap();
-
                 // Get the next frame from the buffer
                 let buf = match rx_enc.recv().await {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(v)) => {

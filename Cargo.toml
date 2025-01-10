@@ -16,5 +16,7 @@ path = "src/demo.rs"
 libcamera = "0.3.0"
 anyhow = "1.0.95"
 tokio = { version = "1", features = ["full"] }
-v4l2r = "0.0.6"
+v4l2r = { version = "0.0.6", git = "https://github.com/sacovo/v4l2r.git", branch = "encoder-ctls" }
 thiserror = "1.0"
+num-traits = "0.2.19"
+num-derive = "0.4.2"
