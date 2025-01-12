@@ -21,3 +21,7 @@ context = "./docker"
 [target.aarch64-unknown-linux-musl.dockerfile]
 file = "./docker/Dockerfile.aarch64-unknown-linux-musl"
 context = "./docker"
+
+[target.arm-unknown-linux-gnueabihf.dockerfile]
+file = "./docker/Dockerfile.arm-unknown-linux-gnueabihf"
+context = "./docker"

@@ -1,31 +1,31 @@
 use std::{
     io::{self, Write},
+    iter::zip,
     path::Path,
     sync::Arc,
     thread,
     time::Duration,
 };
+use thiserror::Error;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use futures::{SinkExt, StreamExt, TryStreamExt};
 use libcamera::{
     camera::{CameraConfiguration, CameraConfigurationStatus},
     camera_manager::CameraManager,
     framebuffer::AsFrameBuffer,
     framebuffer_allocator::{FrameBuffer, FrameBufferAllocator},
     framebuffer_map::MemoryMappedFrameBuffer,
-    geometry::Size,
     pixel_format::PixelFormat,
-    request::ReuseFlag,
-    stream::StreamRole,
+    request::{Request, ReuseFlag},
+    stream::{StreamConfigurationRef, StreamRole},
 };
-use num_traits::FromPrimitive;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::{broadcast, mpsc, watch},
-};
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio_serde::formats::SymmetricalBincode;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-use num_derive::FromPrimitive;
+use serde::{Deserialize, Serialize};
 use v4l2r::{
     controls::{
         codec::{VideoBitrate, VideoH264Level, VideoH264Profile},
@@ -56,6 +56,12 @@ struct CameraResizeRequest {
     size: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
 enum CameraCommand {
     Resize(CameraResizeRequest),
     Empty,
@@ -70,33 +76,35 @@ enum EncoderCommand {
     SetProfile(VideoH264Profile),
 }
 
-#[derive(Debug, FromPrimitive)]
+#[derive(Debug, Serialize, Deserialize)]
 enum ClientCommands {
-    RestartEncoder = 0,
-    Resize = 1,
-    SetBitrate = 2,
-    SetLevel = 3,
-    SetProfile = 4,
-    NextFrame = 10,
+    RestartEncoder,
+    Resize(Size),
+    SetBitrate(i32),
+    SetLevel(String),
+    SetProfile(String),
+    NextFrame,
 }
 
-fn configure_camera(cfgs: &mut CameraConfiguration, width: u32, height: u32, stride: Option<u32>) {
-    cfgs.get_mut(0).unwrap().set_pixel_format(PIXEL_FORMAT);
-    cfgs.get_mut(0).unwrap().set_size(Size { width, height });
+fn configure_camera(
+    cfgs: &mut CameraConfiguration,
+    idx: usize,
+    width: u32,
+    height: u32,
+    stride: Option<u32>,
+) {
+    cfgs.get_mut(idx).unwrap().set_pixel_format(PIXEL_FORMAT);
+    cfgs.get_mut(idx)
+        .unwrap()
+        .set_size(libcamera::geometry::Size { width, height });
     if let Some(stride) = stride {
-        cfgs.get_mut(0).unwrap().set_stride(stride);
-    }
-
-    match cfgs.validate() {
-        CameraConfigurationStatus::Valid => println!("Configuration is valid"),
-        CameraConfigurationStatus::Invalid => panic!("Error while validating configuration"),
-        CameraConfigurationStatus::Adjusted => println!("Configuration was adjusted: {:#?}", cfgs),
+        cfgs.get_mut(idx).unwrap().set_stride(stride);
     }
 }
 
 fn camera_loop(
     idx: usize,
-    tx: std::sync::mpsc::Sender<Arc<Vec<u8>>>,
+    txs: [std::sync::mpsc::Sender<Arc<Vec<u8>>>; 2],
     mut rx: tokio::sync::watch::Receiver<CameraCommand>,
 ) -> Result<()> {
     let manager = CameraManager::new().unwrap();
@@ -105,26 +113,33 @@ fn camera_loop(
         .get(idx)
         .context(format!("Could not open camera at index {idx}"))
         .unwrap();
-    let roles = vec![StreamRole::VideoRecording];
+    let roles = vec![StreamRole::VideoRecording, StreamRole::VideoRecording];
     let mut cfgs = camera
         .generate_configuration(&roles)
         .context("Could not read configuration")?;
 
-    configure_camera(&mut cfgs, WIDTH, HEIGHT, None);
+    configure_camera(&mut cfgs, 0, 1080, 720, None);
+    configure_camera(&mut cfgs, 1, WIDTH, HEIGHT, None);
+
+    match cfgs.validate() {
+        CameraConfigurationStatus::Valid => println!("Configuration is valid"),
+        CameraConfigurationStatus::Invalid => panic!("Error while validating configuration"),
+        CameraConfigurationStatus::Adjusted => println!("Configuration was adjusted: {:#?}", cfgs),
+    }
 
     println!("Using configuration: {:#?}", cfgs);
 
     let mut camera = camera.acquire()?;
     camera.configure(&mut cfgs)?;
 
-    let (mut stream, mut frame_size) = fun_name(&cfgs, &mut camera)?;
+    let mut streams = prepare_camera(&cfgs, &mut camera)?;
 
     let (txr, rxr) = std::sync::mpsc::channel();
     camera.on_request_completed(move |req| {
         txr.send(req).expect("Could not send request");
     });
 
-    'main: loop {
+    loop {
         if rx.has_changed()? {
             let cmd = rx.borrow_and_update();
             match *cmd {
@@ -136,7 +151,7 @@ fn camera_loop(
                 }) => {
                     println!("[CAM] Received new size: {width}x{height} with stride {stride}");
                     camera.stop()?;
-                    configure_camera(&mut cfgs, width, height, Some(stride));
+                    configure_camera(&mut cfgs, 0, width, height, Some(stride));
                     println!(
                         "Requested image size is {}, configured size is {}",
                         size,
@@ -144,70 +159,133 @@ fn camera_loop(
                     );
                     println!("Using configuration: {:#?}", cfgs);
                     camera.configure(&mut cfgs)?;
-                    (stream, frame_size) = fun_name(&cfgs, &mut camera)?;
+                    streams = prepare_camera(&cfgs, &mut camera)?;
                 }
                 CameraCommand::Empty => {}
             }
         }
         let mut req = rxr.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> = req.buffer(&stream).unwrap();
-        let planes = framebuffer.data();
-        let mut data: Vec<u8> = vec![0; frame_size];
-        let plane_info = framebuffer.metadata().unwrap().planes();
-        let mut pos = 0;
-        for i in 0..plane_info.len() {
-            let bytes_used = plane_info.get(i).unwrap().bytes_used as usize;
-
-            if pos + bytes_used > data.len() {
-                println!("Buffer is to large, skipping this image");
-                continue 'main;
+        for i in 0..streams.len() {
+            match read_camera_buffer(cfgs.get(i).unwrap(), &streams[i], &req) {
+                Ok(value) => {
+                    txs[i].send(Arc::new(value))?;
+                }
+                Err(_) => continue,
             }
-
-            let plane = &planes.get(i).unwrap()[0..bytes_used];
-            data[pos..(pos + bytes_used)].copy_from_slice(plane);
-            pos += bytes_used;
         }
-        if pos != frame_size {
-            println!("Buffer was not filled, skipping this image");
-            continue;
-        }
-        tx.send(Arc::new(data))?;
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         camera.queue_request(req)?;
     }
 }
 
-fn fun_name(
+#[derive(Debug, Error)]
+pub enum CameraError {
+    #[error("Buffer is too large")]
+    BufferTooLarge,
+    #[error("Buffer is too small")]
+    BufferTooSmall,
+    #[error("Could not find buffer for the given stream")]
+    NoBufferForStream,
+}
+
+fn read_camera_buffer(
+    cfg: libcamera::utils::Immutable<StreamConfigurationRef>,
+    stream: &libcamera::stream::Stream,
+    req: &libcamera::request::Request,
+) -> Result<Vec<u8>> {
+    let framebuffer: &MemoryMappedFrameBuffer<FrameBuffer> = req
+        .buffer(stream)
+        .context("No buffer for this stream in this request.")?;
+    let planes = framebuffer.data();
+    let frame_size = cfg.get_frame_size() as usize;
+    let mut data: Vec<u8> = vec![0; frame_size];
+    let plane_info = framebuffer.metadata().unwrap().planes();
+    let mut pos = 0;
+
+    for i in 0..plane_info.len() {
+        let bytes_used = plane_info.get(i).unwrap().bytes_used as usize;
+
+        if pos + bytes_used > data.len() {
+            bail!("Buffer is to large, skipping this image");
+        }
+
+        let plane = &planes.get(i).unwrap()[0..bytes_used];
+        data[pos..(pos + bytes_used)].copy_from_slice(plane);
+        pos += bytes_used;
+    }
+    if pos != frame_size {
+        bail!("Buffer was not filled, skipping this image");
+    }
+    Ok(data)
+}
+
+fn prepare_camera(
     cfgs: &CameraConfiguration,
     camera: &mut libcamera::camera::ActiveCamera<'_>,
-) -> Result<(libcamera::stream::Stream, usize), anyhow::Error> {
-    let cfg = cfgs
-        .get(0)
-        .context("Could not get config for first stream")?;
-    let stream = cfg.stream().context("Could not get stream")?;
+) -> Result<[libcamera::stream::Stream; 2], anyhow::Error> {
     let mut alloc = FrameBufferAllocator::new(&*camera);
-    let buffers = alloc.alloc(&stream).unwrap();
 
-    let buffers = buffers
-        .into_iter()
-        .map(|buf| MemoryMappedFrameBuffer::new(buf).unwrap())
-        .collect::<Vec<_>>();
-    let reqs = buffers
-        .into_iter()
+    let (stream0, stream1, reqs0) = create_stream(cfgs, camera, &mut alloc)?;
+
+    camera.start(None)?;
+
+    for req in reqs0 {
+        camera.queue_request(req)?;
+    }
+
+    Ok([stream0, stream1])
+}
+
+fn create_stream(
+    cfgs: &CameraConfiguration,
+    camera: &mut libcamera::camera::ActiveCamera<'_>,
+    alloc: &mut FrameBufferAllocator,
+) -> Result<
+    (
+        libcamera::stream::Stream,
+        libcamera::stream::Stream,
+        Vec<Request>,
+    ),
+    anyhow::Error,
+> {
+    let cfg = cfgs.get(0).context("Could not get config for stream 1")?;
+    let stream = cfg
+        .stream()
+        .context("Could not get stream from configuration")?;
+    let buffers = create_buffers(alloc, stream);
+    let cfg = cfgs.get(1).context("Could not get config for stream 1")?;
+    let stream1 = cfg.stream().context("Could not get stream 1")?;
+    let buffers1 = create_buffers(alloc, stream1);
+
+    let reqs = zip(buffers, buffers1)
         .enumerate()
         .map(|(i, buf)| {
-            let mut req = camera.create_request(Some(i as u64)).unwrap();
-            req.add_buffer(&stream, buf).unwrap();
+            let mut req = camera
+                .create_request(Some(i as u64))
+                .expect("Could not create request");
+            req.add_buffer(&stream, buf.0)
+                .expect("Could not add buffer to request");
+            req.add_buffer(&stream1, buf.1)
+                .expect("Could not add buffer to request");
             req
         })
         .collect::<Vec<_>>();
-    camera.start(None)?;
-    for req in reqs {
-        camera.queue_request(req)?;
-    }
-    let frame_size = cfgs.get(0).unwrap().get_frame_size() as usize;
-    Ok((stream, frame_size))
+    Ok((stream, stream1, reqs))
+}
+
+fn create_buffers(
+    alloc: &mut FrameBufferAllocator,
+    stream: libcamera::stream::Stream,
+) -> Vec<MemoryMappedFrameBuffer<FrameBuffer>> {
+    let buffers = alloc
+        .alloc(&stream)
+        .expect("Failed to allocate buffers for stream {idx}");
+
+    buffers
+        .into_iter()
+        .map(|buf| MemoryMappedFrameBuffer::new(buf).expect("Could not create mmap buffer"))
+        .collect::<Vec<_>>()
 }
 
 fn create_encoder(
@@ -251,6 +329,45 @@ fn create_encoder(
         .allocate_capture_buffers(NUM_BUFFERS, MmapProvider::new(&capture_format))
         .expect("Failed to allocate CAPTURE buffers");
     Ok((encoder, output_format))
+}
+
+fn fixed_encoder_thread(
+    img_in: std::sync::mpsc::Receiver<Arc<Vec<u8>>>,
+    encoder_out: broadcast::Sender<Arc<Vec<u8>>>,
+) -> Result<()> {
+    let input_done_cb = |buffer: CompletedOutputBuffer<GenericBufferHandles>| {
+        let handles = match buffer {
+            CompletedOutputBuffer::Dequeued(mut buf) => buf.take_handles().unwrap(),
+            CompletedOutputBuffer::Canceled(buf) => buf.plane_handles,
+        };
+        if let GenericBufferHandles::Mmap(_) = handles {};
+    };
+
+    let output_ready_cb = move |cap_dqbuf: DqBuffer<Capture, Vec<MmapHandle>>| {
+        let bytes_used = *cap_dqbuf.data.get_first_plane().bytesused as usize;
+        // Ignore zero-sized buffers.
+        if bytes_used == 0 {
+            return;
+        }
+        io::stdout().flush().unwrap();
+        let data = cap_dqbuf.get_plane_mapping(0).unwrap().as_ref().to_vec();
+        encoder_out.send(Arc::new(data)).unwrap();
+    };
+
+    let (encoder, _) = create_encoder(WIDTH as usize, HEIGHT as usize)?;
+
+    let mut encoder = encoder.start(input_done_cb, output_ready_cb)?;
+
+    loop {
+        let buf = encoder.get_buffer().unwrap();
+        if let GenericQBuffer::Mmap(buf) = buf {
+            let mut mapping = buf.get_plane_mapping(0).unwrap();
+            let frame = img_in.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            mapping.as_mut().copy_from_slice(&frame);
+            buf.queue(&[frame.len()])?;
+        }
+    }
 }
 
 fn encoder_thread(
@@ -355,15 +472,33 @@ fn encoder_thread(
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    // Name of the camera that should be used
+    #[arg(short, long)]
+    device_name: String,
+
+    // TCP listen port of the fixed encoder frames
+    #[arg(short, long)]
+    port_fixed: usize,
+
+    // TCP isten port of the variable encoder frames
+    #[arg(short, long)]
+    port_variable: usize,
+}
+
+#[tokio::main]
 async fn main() -> Result<()> {
-    println!("Basline {}", Into::<i32>::into(VideoH264Profile::Baseline));
     let cam_idx = 0;
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let (tx1, rx1) = std::sync::mpsc::channel();
     let (tx_cam, rx_cam) = tokio::sync::watch::channel(CameraCommand::Empty);
     thread::spawn(move || {
-        camera_loop(cam_idx, tx, rx_cam).expect("Error in thread");
+        camera_loop(cam_idx, [tx, tx1], rx_cam).expect("Error in variable encoder thread");
     });
 
     let (tx_enc, _rx_enc) = tokio::sync::broadcast::channel(10);
@@ -373,60 +508,47 @@ async fn main() -> Result<()> {
         encoder_thread(rx, tx_tmp, rx_next, tx_cam).expect("Error in thread");
     });
 
+    let (tx_fix_enc, _rx_enc) = tokio::sync::broadcast::channel(10);
+    thread::spawn(move || {
+        fixed_encoder_thread(rx1, tx_fix_enc).expect("Error in fixed encoder thread");
+    });
+
     let addr = "0.0.0.0:8111";
     let listener = TcpListener::bind(addr).await?;
 
     loop {
         let (socket, addr) = listener.accept().await?;
-        let mut rx_enc = tx_enc.subscribe();
 
-        let (mut srx, mut swx) = socket.into_split();
+        let framed = Framed::new(socket, LengthDelimitedCodec::new());
+        let (mut swx, srx) = framed.split();
+        let mut deserializer = tokio_serde::SymmetricallyFramed::new(
+            srx,
+            SymmetricalBincode::<ClientCommands>::default(),
+        );
+        let mut rx_enc = tx_enc.subscribe();
 
         let tx = tx_next.clone();
 
         tokio::spawn(async move {
-            loop {
-                let mut buf = [0u8; 2];
-                srx.read_exact(&mut buf)
-                    .await
-                    .expect("Could not read two values");
-                let idx = i16::from_le_bytes(buf);
-
-                match FromPrimitive::from_i16(idx) {
-                    Some(ClientCommands::Resize) => {
-                        let mut buf = [0u8; 8];
-                        srx.read_exact(&mut buf)
-                            .await
-                            .expect("Could not read two values");
-                        println!("{:#?}", buf);
-                        let width = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u32;
-                        let height = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as u32;
+            while let Some(cmd) = deserializer.try_next().await.unwrap() {
+                match cmd {
+                    ClientCommands::Resize(Size { width, height }) => {
                         println!("[TCP] Received new size: {width}x{height}");
                         tx.send(EncoderCommand::Resize(Size { width, height }))
                             .await
                             .expect("Could not send resize command");
                         tx.send(EncoderCommand::RestartEncoder).await.expect("Send");
                     }
-                    Some(ClientCommands::SetBitrate) => {
-                        let mut buf = [0u8; 4];
-                        srx.read_exact(&mut buf)
-                            .await
-                            .expect("Could not read two values");
-                        let size = i32::from_le_bytes(buf);
-                        println!("[TCP] Received new bitrate: {size}");
-                        tx.send(EncoderCommand::SetBitrate(size))
+                    ClientCommands::SetBitrate(bitrate) => {
+                        tx.send(EncoderCommand::SetBitrate(bitrate))
                             .await
                             .expect("Could not send bitrate cmd");
                     }
-                    Some(ClientCommands::SetProfile) => {
-                        let mut buf = [0u8; 4];
-                        srx.read_exact(&mut buf)
-                            .await
-                            .expect("Could not read two values");
-                        let profile = match i32::from_le_bytes(buf) {
-                            1 => VideoH264Profile::Baseline,
-                            2 => VideoH264Profile::Main,
-                            3 => VideoH264Profile::High,
+                    ClientCommands::SetProfile(profile) => {
+                        let profile = match profile.as_str() {
+                            "baseline" => VideoH264Profile::Baseline,
+                            "main" => VideoH264Profile::Main,
+                            "high" => VideoH264Profile::High,
                             _ => VideoH264Profile::Baseline,
                         };
 
@@ -435,19 +557,15 @@ async fn main() -> Result<()> {
                             .await
                             .expect("Could not send bitrate cmd");
                     }
-                    Some(ClientCommands::SetLevel) => {
-                        let mut buf = [0u8; 4];
-                        srx.read_exact(&mut buf)
-                            .await
-                            .expect("Could not read two values");
-                        let level = match i32::from_le_bytes(buf) {
-                            11 => VideoH264Level::L1_1,
-                            21 => VideoH264Level::L2_1,
-                            22 => VideoH264Level::L2_2,
-                            3 => VideoH264Level::L3_1,
-                            32 => VideoH264Level::L3_2,
-                            4 => VideoH264Level::L4_0,
-                            41 => VideoH264Level::L4_1,
+                    ClientCommands::SetLevel(level) => {
+                        let level = match level.as_str() {
+                            "11" => VideoH264Level::L1_1,
+                            "21" => VideoH264Level::L2_1,
+                            "22" => VideoH264Level::L2_2,
+                            "3" => VideoH264Level::L3_1,
+                            "32" => VideoH264Level::L3_2,
+                            "4" => VideoH264Level::L4_0,
+                            "41" => VideoH264Level::L4_1,
                             _ => VideoH264Level::L4_2,
                         };
                         println!("[TCP] Received new profile: {level:?}");
@@ -455,19 +573,19 @@ async fn main() -> Result<()> {
                             .await
                             .expect("Could not send bitrate cmd");
                     }
-                    Some(ClientCommands::RestartEncoder) => {
+                    ClientCommands::RestartEncoder => {
                         tx.send(EncoderCommand::RestartEncoder)
                             .await
                             .expect("Could not send cmd");
                     }
-                    Some(ClientCommands::NextFrame) => {
+                    ClientCommands::NextFrame => {
                         tx.send(EncoderCommand::NextFrame)
                             .await
                             .expect("Could not send cmd");
                     }
-                    None => {}
                 }
             }
+            println!("Invalid command received, closing connection");
         });
 
         let tx = tx_next.clone();
@@ -480,25 +598,14 @@ async fn main() -> Result<()> {
             loop {
                 // Get the next frame from the buffer
                 let buf = match rx_enc.recv().await {
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(v)) => {
-                        println!("Lagged: {v}");
-                        continue;
-                    }
-                    Ok(buf) => buf,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(buf) => buf,
                 };
 
-                let bytes = &(buf.len() as u32).to_be_bytes();
-
-                swx.write_all(bytes)
+                swx.send(tokio_util::bytes::Bytes::copy_from_slice(buf.as_slice()))
                     .await
-                    .expect("Could not send size of buffer");
-
-                swx.flush().await.unwrap();
-                if let Err(e) = swx.write_all(&buf).await {
-                    println!("Error detected, disconnecting: {e}");
-                    break;
-                }
+                    .expect("Could not send bytes");
                 swx.flush().await.unwrap();
             }
         });
